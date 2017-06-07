@@ -1,0 +1,469 @@
+# bidirectional LSTM과 linear CRF를 이용한 한글 자동 띄어쓰기 
+
+필자가 한글자동띄어쓰기를 처음 [R로 구현한 결과에 대한 링크](http://freesearch.pe.kr/archives/2746)를 참고하면 한글 자동띄어쓰기가 어떠한 방식으로 구현되는지 기초적인 부분을 알 수 있을 것이다. 개인적으로 한글 텍스트 분석에서 띄어쓰기는 생각보다 중요한 부분을 차지하고 있다고 생각한다. 이 부분이 잘 되지 않는다면 이후의 다양한 한글분석 퀄리티에 큰 영향을 끼질 수 있기 때문이다. 
+
+[KoNLP](https://CRAN.R-project.org/package=KoNLP) 역시 한글 자동 띄어쓰기 모듈이 있기는하나, 매우 조악한 수준이며 이를 위해 RNN을 이용한 한글 띄어쓰기 모델링을 진행하고 있다. 지금부터 소개할 모듈은 RNN을 이용한 한글 자동띄어쓰기의 일부분을 소개할 것인데, 개인적으로 추가 연구한 부분의 코드는 연구가 진행됨에 따라 [이곳](https://github.com/haven-jeon/KoWordSpacing)에서 공개할 예정이다. 
+
+
+이 작업은 크게 두 부분으로 나뉘어져 있다. 
+
+1. 음절단위 속성 벡터 추출 
+2. bidirectional LSTM과 Linear CRF를 이용한 모형 학습 
+
+일단 필요한 패키지를 로딩한다. `hashmap`은 문자열에 대한 인덱스를 조회할때 사용되고, `caret`은 학습셋 셔플링시, 그리고 `stringi`,`stringr`의 경우 문자열 전처리에 쓰일 예정이다. 
+
+```{r, message=FALSE}
+library(tensorflow)
+library(hashmap)
+library(wordVectors)
+library(caret)
+library(stringr)
+library(stringi)
+library(data.table)
+library(reshape2)
+
+#문자열 전체 빈도로 분포로 볼때 7회 미만은 빈도 1분위 미만이며, 이들에 대해서는 아래 문자로 대체한다. 
+specl_char <- '⊙'
+```
+
+
+## 음절단위 속성 벡터 추출
+
+
+코드가 다소 복잡한데, 사실 과정은 그리 복잡하지는 않다. 
+코퍼스에서 아래와 같은 문장을 문자열과 공백으로 쪼개는 과정을 수행하고 `wordVectors`패키지를 이용해 char vector형태의 속성 매트릭스를 만들면 된다. 
+R에서도 Python과 같이 매우 간단한 명령어로 word2vector를 만들 수 있는 패키지가 있는 관계로 굳이 복잡한 코드를 구현하지 않아도 된다. 
+
+`train_word2vec`함수에서는 공백으로 구분되는 문자열을 하나의 학습셋으로 받아들이는 구조를 가지고 있기 때문에 아래와 같이 character레벨의 벡터를 생성하기 위해 공백으로 문장을 구분해 파일을 생성한 뒤 이를 기반으로 학습을 시키도록 한다. 
+
+> 아버지가 방을 나가셨다. -> 아 버 지 가 방 을 나 가 셨 다.
+
+
+
+```{r, cache=T, message=FALSE, results='asis', eval=F}
+corpus <- readLines(bzfile("input.txt.bz2"))
+
+corpus_cl <- stri_replace_all_regex(stri_trans_nfkc(corpus), pattern = '[:blank:]', replacement = '')
+
+corpus_cl_split <- lapply(corpus_cl, function(x){
+   paste(str_split(x, pattern = '')[[1]], collapse = ' ')
+})
+
+tbl_a <- table(unlist(corpus_cl_split))
+summary(as.numeric(tbl_a))
+
+#빈도 분포 확인 후 7회 이하 빈도는 다른 문자로 대체 
+length(tbl_a[tbl_a < 7])
+pat <- paste0('[', paste0(Filter(function(x) {nchar(x) == 1}, names(tbl_a[tbl_a < 7])),  collapse = ''), ']')
+
+
+replaced_sent <- lapply(corpus_cl_split, function(x){str_replace(x, pattern = pat, replacement = specl_char)})
+
+
+writeLines(unlist(replaced_sent), 'sejong_char_seq.txt')
+
+w2v_model <- train_word2vec("sejong_char_seq.txt","sejong_char_seq.bin",
+                       vectors=50,threads=8,window=10,iter=20,negative_samples=10, force=T)
+
+w2v_model %>% closest_to('컴')
+```
+
+결국 위의 `w2v_model`은 `(고유문자수 x 50)`의 형태를 가지는 가중치 매트릭스를 가지게 된다. 
+물론 이 부분은 word2vector 알고리즘을 그대로 사용하기도 하지만 목적에 맞는 vector를 생성하는 네트워크를 직접 구축해 볼 수도 있을 것이다. 
+
+## Korean word spacing RNN 
+
+띄어쓰기는 대표적인 `sequence-to-sequence` 문제이며, "예제문장입니다."이 입력되었을 때  "01000001"와 같은 띄어쓰기 시퀀스를 출력하는 문제로 정의할 수 있다. 여기서 0은 다음 문자가 붙여쓴다는 의미이고 1은 띄어쓴다는 의미이다. 
+
+여러 네트웍 구축 및 테스트해본 결과 필자는 [`Bidirectional LSTM-CRF Models`](https://arxiv.org/abs/1508.01991) 모형을 기반으로 학습을 시켰다. 학습 데이터는 세종 코퍼스에서 추출한 약 8만 문장을 활용하였다. 
+
+마지막 loss를 계산할때 개별 문자열의 softmax output정보만을 활용하기 보다는 CRF를 이용해서 이전 시퀀스의 결과에 따른 영향을 고려할 수 있도록 했는데, 이러한 이유는 띄어쓰기가 연속으로 일어날 확률은 실제 매우 적기 때문이고 LSTM만으로는 이러한 부분을 케어하지 못하기 때문이다. 이 부분은 기존의 띄어쓰기 알고리즘이 HMM이나 CRF모형을 많이 사용하는 이유와 매우 유사한데, 직접 구현할 필요 없이 TensorFlow에 포함된 함수를 기반으로 구현했다. 
+
+
+
+
+```{r making_word_resource, message=FALSE, cache=T}
+
+#analyze to extract word spacing info.
+# makeCorpus("옷을 만드느라 늘")
+#$status
+# [1] 0 1 0 0 0 1 1
+# 
+# $char
+# [1] "옷" "을" "만" "드" "느" "라" "늘"
+# 
+# $nchar
+# [1] 7
+makeCorpus <- function(str){
+  strv <- strsplit(str,split="")[[1]]
+  lenstrv <- length(strv)
+  spacev <- vector(mode="numeric",length=lenstrv)
+  charv  <- vector(mode="character",length=lenstrv)
+  vidx <- 1
+  for(i in 1:lenstrv){
+    if(strv[i] == " ") {
+      next
+    }
+    if(i + 1 <= lenstrv && strv[i + 1] == " "){
+      spacev[vidx] <- 1
+    }else{
+      if(i == lenstrv){
+        spacev[vidx] <- 1
+      }else{
+        spacev[vidx] <- 0
+      }
+    }
+    charv[vidx] <- strv[i]
+    vidx <- vidx + 1
+  }
+  charv_f <- Filter(function(x){x!=''},charv)
+  status <- spacev[1:length(charv_f)]
+  char <- charv_f
+  nchar <-length(charv_f)
+  return(list(status=status, char=char, nchar=nchar))
+}
+
+#read char2vector object 
+m <- read.vectors("sejong_char_seq.bin")
+
+#read corpus
+sents <-readLines(bzfile('input.txt.bz2'),encoding='UTF-8')
+
+
+#5어절씩 학습 문장을 만든다. 
+sents_eojeol <- str_split(stri_trans_nfkc(sents), pattern = '[:blank:]')
+wordchunk <- lapply(sents_eojeol, function(x){
+  x <- Filter(function(y){y != ''}, x)
+  v <- c()
+  k <- 5
+  if(length(x) < k) return(paste( c( x, ''),collapse = " "))
+  
+  for(i in 1:length(x)){
+    if((i + k - 1) > length(x)) break
+    v <- c(v, paste(c(x[i:(i + k - 1)], ''), collapse = " "))
+  }
+  return(v)
+  })
+
+
+wordchunk <- unlist(wordchunk)
+
+space_coding  <- lapply(wordchunk, makeCorpus)
+
+#extract each word chunk length
+charsents <- lapply(space_coding, function(x){x$char})
+uniq_chars <- unique(unlist(charsents))
+max_seq_len <- max(unlist(lapply(space_coding, function(x){x$nchar})))
+
+#make sentence coding 
+seq_mat_x <- matrix(0, ncol=max_seq_len, nrow=length(wordchunk))
+
+#make hash map to extract row index of m
+chmap <- hashmap(rownames(m), 0:(nrow(m)-1))
+
+for(i in 1:length(wordchunk)){
+  sent <- space_coding[[i]]$char
+  for(j in 1:length(sent)){
+    idx <- chmap[[sent[j]]]
+    if(is.na(idx)) idx <- chmap[[specl_char]]
+    seq_mat_x[i,j] <- idx
+  }
+}
+
+
+seq_mat_y <- matrix(0, ncol=max_seq_len, nrow=length(wordchunk))
+loss_mask <-matrix(0, ncol=max_seq_len, nrow=length(wordchunk))
+
+for(i in 1:length(wordchunk)){
+  sent <- space_coding[[i]]$status
+  for(j in 1:length(sent)){
+    seq_mat_y[i,j] <- sent[j] 
+    loss_mask[i,j] <- 1
+  }
+}
+
+
+len_list <-  unlist(lapply(space_coding, function(x){x$nchar}))
+sent_chars <- lapply(space_coding, function(x){x$char})
+
+```
+
+
+```{r}
+library(R6)
+
+WordSpacing <- R6Class("WordSpacing",
+    public = list(
+      char_dic_size=NULL, 
+      n_neurons=NULL, 
+      num_classes=NULL, 
+      batch_size=NULL,
+      max_sequence_length=NULL, 
+      word_spacing_graph=NULL,
+      config_proto=NULL, 
+      mem_fraction=NULL, 
+      x=NULL, y=NULL, 
+      sent_len=NULL, loss=NULL, prediction=NULL, optimizer=NULL,
+      init=NULL, saver=NULL, global_step=NULL, num_out_classes=NULL,weight_mask=NULL,
+      c2v=NULL, embeddings=NULL, seg_loss=NULL, accuracy=NULL,chmap=NULL, 
+      transition_params=NULL, logit=NULL,
+      
+      initialize=function(char_dic_size, n_neurons, num_classes, num_out_classes, max_sequence_length,
+                           c2v, mem_fraction=0.999,global_step = 1L){
+        self$char_dic_size <- as.integer(char_dic_size)
+        self$n_neurons <- as.integer(n_neurons)
+        self$num_classes <- as.integer(num_classes)
+        self$num_out_classes <- as.integer(num_out_classes)
+        self$max_sequence_length <- as.integer(max_sequence_length)
+        self$global_step <- as.integer(global_step)
+        self$c2v <- c2v
+        #self$is_training <- FALSE
+        self$chmap <- hashmap(rownames(self$c2v), 0:(nrow(self$c2v)-1))
+        
+        
+        
+        gpu_options <- tf$GPUOptions(per_process_gpu_memory_fraction=mem_fraction)
+        self$config_proto <- tf$ConfigProto(allow_soft_placement=T,log_device_placement=F, gpu_options=gpu_options)
+        
+        self$word_spacing_graph <- tf$Graph()
+        
+        with(self$word_spacing_graph$as_default(), {
+          with(tf$name_scope("kor_word_spacing"),{
+            with(tf$device("/gpu:0"), {
+              
+              #(batch  x max_sequence_length)
+              self$x <- tf$placeholder(tf$int32, list(NULL, self$max_sequence_length), name='x') 
+              # WordVectors로 학습된 char vector (char_dic_size x 100)
+              self$embeddings <- tf$Variable(self$c2v, dtype=tf$float32, trainable=FALSE, 
+                                             name = 'embeddings')
+              # (batch x max_sequence_length)
+              self$y <- tf$placeholder(tf$int32, list(NULL, self$max_sequence_length), name='y')  
+              # (batch)
+              self$sent_len <- tf$placeholder(tf$int32, list(NULL), name='sent_len') 
+              #Loss 계산을 위한 masking 생성
+              #문장 길이가 서로 다르기 때문임...
+              self$weight_mask <- tf$sequence_mask(self$sent_len)
+              self$batch_size <-  tf$placeholder(tf$int32, shape = list(), name='batch_size')
+
+            })              
+            with(tf$device("/gpu:1"), {
+
+              with(tf$name_scope('rnn_cell'),{
+                x_emb <- tf$nn$embedding_lookup(self$embeddings, self$x)
+                
+                cell <- tf$contrib$rnn$LSTMCell(num_units=self$n_neurons,use_peepholes=T)
+                
+                outputs_states <- tf$nn$bidirectional_dynamic_rnn(cell, cell, 
+                                     x_emb, sequence_length=self$sent_len,dtype=tf$float32)
+                
+              }) 
+              output_fw_output_bw <- outputs_states[[1]]
+              #( (max_sequence_length + batch)  x n_neurons * 2)
+              outputs <- tf$concat(list(output_fw_output_bw[[1]], output_fw_output_bw[[2]]), axis = -1L)
+              
+              with(tf$name_scope('fc1'),{
+                
+                x_fc <- tf$reshape(outputs, list(-1L, self$n_neurons * 2L))
+                fc_w <- tf$get_variable("fc_w", list(self$n_neurons * 2L,
+                                                     self$num_out_classes),
+                                        initializer=tf$contrib$layers$xavier_initializer())
+                fc_b <- tf$get_variable("fc_b", list(self$num_out_classes),
+                                        initializer=tf$zeros_initializer())
+                fc1 <-  tf$matmul(x_fc, fc_w) + fc_b
+              })
+              
+              #l2_losses <- tf$reduce_sum(tf$abs(fc_w)) 
+  
+              # reshape out for sequence_loss
+              self$logit <- tf$reshape(fc1, list(-1L, self$max_sequence_length,
+                                              self$num_out_classes))
+              
+              
+              log_likelihood_transition_params <- tf$contrib$crf$crf_log_likelihood(
+                  self$logit, self$y, self$sent_len)
+              self$loss <- tf$reduce_mean(-log_likelihood_transition_params[[1]])
+              self$transition_params <- log_likelihood_transition_params[[2]]
+              
+
+              self$optimizer <- tf$train$AdamOptimizer(learning_rate=0.001)$minimize(self$loss, name='optimizer')
+                
+              # Define a saver op
+              self$init <- tf$global_variables_initializer()
+              self$saver <- tf$train$Saver(max_to_keep=0L, name='saver')
+            })
+          })
+          
+        })
+      }, 
+      decoding = function(logit, transition_params, nchar){
+        
+        tags <- tf$contrib$crf$viterbi_decode(
+                        logit[1:nchar,], transition_params)
+        return(matrix(unlist(tags[[1]]), nrow=1))
+      },
+      train = function(seq_mat_x, seq_mat_y, sent_len_x, batch_n, epoch=10L, retrain_from=0){
+        tr_idx <- 1:(0.95 * nrow(seq_mat_x))
+        
+        seq_mat_x_train <- seq_mat_x[tr_idx, ]
+        seq_mat_x_test <- seq_mat_x[-tr_idx, ]
+        
+        seq_mat_y_train <- seq_mat_y[tr_idx, ]
+        seq_mat_y_test <- seq_mat_y[-tr_idx, ]
+        len_list_train <- sent_len_x[tr_idx]
+        len_list_test <- sent_len_x[-tr_idx]
+
+        loss_v <- c()
+        loss_vt <- c()
+        #self$is_training <- TRUE
+        
+
+        x <- self$x
+        embeddings <- self$embeddings
+        y <- self$y
+        sent_len <- self$sent_len
+        batch_size <- self$batch_size
+        
+        with(tf$Session(config=self$config_proto, graph=self$word_spacing_graph) %as% sess, {
+          if(retrain_from > 0){
+            self$saver$restore(sess, sprintf("model/model_%d.chkp-%d",retrain_from, self$global_step))
+            st_epoch <- retrain_from + 1
+          }else{
+            sess$run(self$init)
+            st_epoch <- 1
+          }
+          for(i in st_epoch:epoch){
+            #shufle 
+            rnd_idx <- sample(1:nrow(seq_mat_x_train), nrow(seq_mat_x_train))
+            
+            seq_mat_x_ <- seq_mat_x_train[rnd_idx,]
+            seq_mat_y_ <- seq_mat_y_train[rnd_idx,]
+            sent_len_x_ <- len_list_train[rnd_idx]
+            
+            j <- 0
+            for(k in seq(1, nrow(seq_mat_x_train), batch_n)){
+              if( k + batch_n - 1 > nrow(seq_mat_x_train)){
+                bat_size <- nrow(seq_mat_x_train)  + 1 - k
+              }else{
+                bat_size <- batch_n
+              }
+              self$c2v
+              l <- sess$run(list(self$loss, self$optimizer), feed_dict=
+                                dict(
+                                    x=matrix(seq_mat_x_[k:(k + bat_size - 1),], byrow=T, nrow=bat_size),
+                                    y= matrix(seq_mat_y_[k:(k + bat_size - 1),], byrow=T, nrow=bat_size), 
+                                    sent_len= sent_len_x_[k:(k + bat_size - 1)],
+                                    batch_size=as.integer(bat_size)
+                                ))
+              j <- j + 1
+              if(j %% 300 == 0){
+                #self$is_training <- F
+                print(sprintf("%d:%d train loss : %f, seg loss : .., accuracy : ..", i, j, l[[1]]))
+                loss_v <- c(loss_v, l[[1]])
+                test_sent <- "아버지가방에들어가셨다."
+                coding_mat <- self$sent_to_code(test_sent)
+                logits_transition_params <- sess$run(list(self$logit,self$transition_params),
+                                   feed_dict=dict(
+                                                  x=coding_mat[[1]],
+                                                  sent_len=list(coding_mat[[2]]),
+                                                  batch_size=c(1L)))
+                result <- self$decoding(logits_transition_params[[1]][1,,], 
+                                        logits_transition_params[[2]], nchar(test_sent))
+                
+                print(self$code_to_sent(test_sent, result, nchar(test_sent)))
+                loss_eval <- sess$run(list(self$loss), feed_dict=
+                                dict(
+                                     x=seq_mat_x_test,
+                                     y= seq_mat_y_test, 
+                                     sent_len= len_list_test,
+                                     batch_size=as.integer(dim(seq_mat_x_test)[1])
+                                ))
+                print(sprintf("%d:%d test loss : %f, accuracy : ...", i, j, loss_eval[[1]]))
+                loss_vt <- c(loss_vt, loss_eval[[1]])
+                
+              }
+            }
+           
+            save_path <- self$saver$save(sess=sess, save_path = sprintf("model/model_%d.chkp", i),
+                                    global_step =self$global_step)
+           
+            print(sprintf("Model saved in file: %s",  save_path))
+          }
+          
+        })
+        return(list(loss_v, loss_vt))
+      },
+      predict = function(test_sent, best_epoc, glob_step=1L){
+        x <- self$x
+        embeddings <- self$embeddings
+        sent_len <- self$sent_len
+        batch_size <- self$batch_size
+        coding_mat <- self$sent_to_code(test_sent)
+        with(tf$Session(config=self$config_proto, graph=self$word_spacing_graph) %as% sess, {
+          self$saver$restore(sess, sprintf("model/model_%d.chkp-%d",best_epoc, glob_step))
+          #self$is_training <- F
+          logits_transition_params <- sess$run(list(self$logit,self$transition_params),feed_dict=dict(
+                                                            x=coding_mat[[1]],
+                                                            sent_len=list(coding_mat[[2]]), 
+                                                            batch_size=c(1L)))
+        })
+        #print(logits_transition_params[[2]])
+        result <- self$decoding(logits_transition_params[[1]][1,,], 
+                                        logits_transition_params[[2]], nchar(test_sent))
+        
+        return(self$code_to_sent(test_sent, result, nchar(test_sent)))
+      },
+      code_to_sent=function(input_sent, coding_mat, coding_len){
+        char_sent <- str_split(input_sent, '')[[1]]
+        ch <- c()
+        for(i in 1:coding_len){
+          if(coding_mat[1,i] == 1){
+            ch <- c(ch, char_sent[i] ,' ')
+          }else{
+            ch <- c(ch, char_sent[i])
+          }
+        }
+        return(paste0(ch, collapse = ''))
+      },
+      sent_to_code=function(sentence){
+        seq_mat_test <- matrix(0, ncol=max_seq_len, nrow=1)
+  
+        sent_t <- str_split(sentence, pattern = '')[[1]]
+        for(j in 1:length(sent_t)){
+          idx <- self$chmap[[sent_t[j]]]
+          if(is.na(idx)) idx <- self$chmap[[specl_char]]
+          seq_mat_test[1,j] <- idx
+        }
+        return(list(seq_mat_x=seq_mat_test, nchar=nchar(sentence)))
+      }
+))
+
+```
+
+네트워크 아키텍처는 아래 도식과 같다. 
+
+![bi-LSTM-CRF](lstm.png)
+
+
+## train and Evaluation 
+
+```{r}
+wsp <- WordSpacing$new(char_dic_size=dim(m)[1], n_neurons=5L, num_out_classes=2L, 
+                       num_classes=50L, 
+                       max_sequence_length=max_seq_len, c2v=m, global_step = 1L)
+
+
+tr_loss <- wsp$train(seq_mat_x, seq_mat_y, len_list, batch_n=100L, epoch = 1)
+
+tr_te_loss <- data.table(train_loss= tr_loss[[1]], test_loss=tr_loss[[2]])
+
+tr_te_loss[,idx:=1:nrow(tr_te_loss)]
+
+ggplot(melt(tr_te_loss, id.vars = 'idx'), aes(idx, value)) + 
+  geom_line(aes(colour=variable)) + xlab('every 300 batch') + ylab('loss')
+
+
+wsp$predict("크리스마스는친구와함께!",best_epoc = 1)
+wsp$predict("대표직을사퇴한그는새로운사업을시작했다.",best_epoc = 1)
+wsp$predict("일정한조건에따르면-자유롭게-이것을재배포할수가있습니다.",best_epoc = 1)
+```
+
